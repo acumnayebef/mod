@@ -62,23 +62,11 @@ static int Off(void *k, const char *f) {
     void *fi = k ? il2cpp_class_get_field_from_name(k, f) : NULL;
     return fi ? il2cpp_field_get_offset(fi) : -1;
 }
-// метод по имени, числу параметров и типу параметра #idx (для перегрузок)
-static void *MByParam(void *k, const char *name, unsigned argc, unsigned idx, const char *typeName) {
-    void *it = NULL, *m;
-    while ((m = il2cpp_class_get_methods(k, &it))) {
-        if (strcmp(il2cpp_method_get_name(m), name) || il2cpp_method_get_param_count(m) != argc) continue;
-        char *tn = il2cpp_type_get_name(il2cpp_method_get_param(m, idx));
-        if (tn && !strcmp(tn, typeName)) return m;
-    }
-    return NULL;
-}
-
 #define FLT(o, off) (*(float *)((char *)(o) + (off)))
 #define BOOL_(o, off) (*(bool *)((char *)(o) + (off)))
 #define PTR(o, off) (*(void **)((char *)(o) + (off)))
 
 struct V3 { float x, y, z; };
-struct Q4 { float x, y, z, w; };
 
 static bool Inv(void *m, void *obj, void **args, void **ret = NULL) {
     if (!m) return false;
@@ -90,9 +78,12 @@ static bool Inv(void *m, void *obj, void **args, void **ret = NULL) {
 
 // Unity-методы
 static void *m_getPos, *m_setPos, *m_getFwd, *m_goTr, *m_goSetActive, *m_goActive;
-static void *m_camMain, *m_w2s, *m_ccMove, *m_collEnabled, *m_scrW, *m_scrH, *m_findObjs, *m_instantiate;
+static void *m_camMain, *m_w2s, *m_ccMove, *m_collEnabled, *m_scrW, *m_scrH, *m_findObjs;
 static void *k_Inv, *k_Cam;   // классы InventoryController и Camera
 static void *m_compTr, *m_behEnabled, *m_camDepth, *m_camOrtho, *m_checkInv;
+static void *k_PickUp, *k_ShootArrow;
+static int pkLoaded, pkLad, pkOlad, saLad, saOlad;
+static char g_dbg2[160] = "";
 
 static bool GetV3(void *m, void *obj, V3 *out) {
     void *r = NULL;
@@ -112,7 +103,7 @@ static struct {
 } S;
 static volatile bool  g_up = false, g_down = false, g_jumpReq = false;
 static char g_dbg[200] = "";
-static volatile int   g_tpReq = -1, g_bringReq = -1, g_bringMode = 0;   // mode: 0 переместить, 1 клонировать
+static volatile int   g_tpReq = -1, g_bringReq = -1, g_bringMode = 0;   // mode: 0 выдать в инвентарь, 1 переместить
 static volatile float g_grannyDist = -1;
 static volatile CFAbsoluteTime g_grannySeen = 0, g_msgT = 0, g_espT = 0;
 static char g_msg[96] = "";
@@ -171,6 +162,26 @@ static void h_GrannyFU(void *self, void *mi) {
     g_grannySeen = CFAbsoluteTimeGetCurrent();
 }
 
+static void *FindFirst(void *klass) {
+    if (!klass) return NULL;
+    void *typ = il2cpp_type_get_object(il2cpp_class_get_type(klass));
+    void *a[1] = { typ }, *arr = NULL;
+    if (!Inv(m_findObjs, NULL, a, &arr) || !arr) return NULL;
+    if (*(uint32_t *)((char *)arr + 0x18) == 0) return NULL;
+    return *(void **)((char *)arr + 0x20);
+}
+static bool GOActive(void *go) {
+    void *r = NULL;
+    return go && Inv(m_goActive, go, NULL, &r) && r && *(bool *)il2cpp_object_unbox(r);
+}
+static void SetGO(void *go, bool v) { if (go) { void *a[1] = { &v }; Inv(m_goSetActive, go, a); } }
+// «разряженная» модель арбалета активна → меняем на «заряженную»
+static bool ReloadModels(void *holder, int ladOff, int oladOff) {
+    if (ladOff < 0 || oladOff < 0) return false;
+    void *lad = PTR(holder, ladOff), *olad = PTR(holder, oladOff);
+    if (olad && GOActive(olad)) { SetGO(olad, false); SetGO(lad, true); return true; }
+    return false;
+}
 static void *FindInventory() {
     void *typ = il2cpp_type_get_object(il2cpp_class_get_type(k_Inv));
     void *a[1] = { typ }, *arr = NULL;
@@ -329,11 +340,23 @@ static void h_PlayerFU(void *self, void *mi) {
     }
 
     // ── патроны ──
-    if (S.ammo && inv) {
-        if (oShotLoaded >= 0 && oHaveShotgun >= 0 && BOOL_(inv, oHaveShotgun)) BOOL_(inv, oShotLoaded) = true;
-        if (oHaveArrow >= 0 && oHaveCrossbow >= 0 && BOOL_(inv, oHaveCrossbow)) {
-            BOOL_(inv, oHaveArrow) = true; if (oArrowOK >= 0) BOOL_(inv, oArrowOK) = true;
+    if (S.ammo) {
+        static void *pk = NULL, *sa = NULL; static int fixes = 0;
+        if (!pk || frame % 20 == 1) pk = FindFirst(k_PickUp);
+        if (!sa || frame % 20 == 1) sa = FindFirst(k_ShootArrow);
+        if (inv) {                                           // сцены с InventoryController
+            if (oShotLoaded >= 0) BOOL_(inv, oShotLoaded) = true;
+            if (oHaveArrow >= 0 && oHaveCrossbow >= 0 && BOOL_(inv, oHaveCrossbow)) {
+                BOOL_(inv, oHaveArrow) = true; if (oArrowOK >= 0) BOOL_(inv, oArrowOK) = true;
+            }
         }
+        if (pk && pkLoaded >= 0) BOOL_(pk, pkLoaded) = true;  // сцены со старым PickUp
+        if (frame % 3 == 0) {
+            if (pk && ReloadModels(pk, pkLad, pkOlad)) fixes++;
+            if (sa && ReloadModels(sa, saLad, saOlad)) fixes++;
+        }
+        snprintf(g_dbg2, sizeof g_dbg2, "Патроны: Inventory %s, PickUp %s, ShootArrow %s, перезарядок арбалета: %d",
+                 inv ? "да" : "нет", pk ? "да" : "нет", sa ? "да" : "нет", fixes);
     }
 
     // ── подсветка предметов ──
@@ -404,13 +427,13 @@ static void Setup() {
     m_scrW = M(kScr, "get_width", 0); m_scrH = M(kScr, "get_height", 0);
     m_findObjs = M(kObj, "FindObjectsOfType", 1);
     k_Cam = kCam;
+    k_PickUp = FindClass("", "PickUp"); k_ShootArrow = FindClass("", "ShootArrow");
+    pkLoaded = Off(k_PickUp, "oldShotgunLoaded"); pkLad = Off(k_PickUp, "Armborstladdad"); pkOlad = Off(k_PickUp, "ArmborstOladdad");
+    saLad = Off(k_ShootArrow, "laddad"); saOlad = Off(k_ShootArrow, "Oladdad");
     m_compTr = M(FindClass("UnityEngine", "Component"), "get_transform", 0);
     m_behEnabled = M(FindClass("UnityEngine", "Behaviour"), "get_enabled", 0);
     m_camDepth = M(kCam, "get_depth", 0); m_camOrtho = M(kCam, "get_orthographic", 0);
     m_checkInv = M(k_Inv, "CheckInventory", 0);
-    m_instantiate = kObj ? MByParam(kObj, "Instantiate", 3, 1, "UnityEngine.Vector3") : NULL;
-    NSLog(@"[Xantapers] unity api: pos=%p set=%p fwd=%p goTr=%p act=%p cam=%p w2s=%p cc=%p coll=%p find=%p inst=%p",
-          m_getPos, m_setPos, m_getFwd, m_goTr, m_goActive, m_camMain, m_w2s, m_ccMove, m_collEnabled, m_findObjs, m_instantiate);
 
     // поля
     oWalk = Off(kGranny, "walkSpeed"); oFollow = Off(kGranny, "grannysFollowSpeed"); oAttack = Off(kGranny, "attackDistance");
@@ -572,7 +595,7 @@ static NSString *TpTitle(int i) {
 
 - (void)selectTab:(NSInteger)i {
     CGFloat maxH = MAX(120, self.overlay.bounds.size.height - 190);
-    for (NSInteger k = 0; k < 3; k++) self.stacks[k].hidden = (k != i);
+    for (NSInteger k = 0; k < 4; k++) self.stacks[k].hidden = (k != i);
     CGFloat fh = self.heights[i].floatValue, h = MIN(fh, maxH);
     self.scroll.contentSize = CGSizeMake(262, fh); self.scroll.contentOffset = CGPointZero;
     self.scroll.frame = CGRectMake(14, 86, 262, h);
@@ -639,7 +662,24 @@ static NSString *TpTitle(int i) {
             [self button:@"К Бабке" primary:YES block:^{ g_tpReq = 2; }] ]],
         [self card:@"Точки Бабки" rows:pts] ]];
 
-    self.stacks = @[t0, t1, t2];
+    // ── вкладка «Автор» ──
+    UILabel *aTitle = [self label:@"Xantapers mod" size:24 color:UIColor.whiteColor];
+    aTitle.font = [UIFont systemFontOfSize:24 weight:UIFontWeightHeavy];
+    UILabel *aCreator = [self label:@"Creator: Xantapers" size:16 color:ACCENT];
+    aCreator.font = [UIFont systemFontOfSize:16 weight:UIFontWeightSemibold];
+    UILabel *aTg = [self label:@"Telegram: @xantapers" size:15 color:UIColor.whiteColor];
+    UIStackView *t3 = [self column:@[
+        [self card:@"О создателе" rows:@[ aTitle, aCreator, aTg ]],
+        [self card:@"Telegram-канал" rows:@[
+            [self label:@"Новости, обновления и поддержка — в канале @xantapers." size:13 color:[UIColor colorWithWhite:1 alpha:0.7]],
+            [self button:@"Открыть канал @xantapers" primary:YES block:^{
+                [UIApplication.sharedApplication openURL:[NSURL URLWithString:@"https://t.me/xantapers"] options:@{} completionHandler:nil];
+            }],
+            [self button:@"Скопировать @xantapers" primary:NO block:^{
+                UIPasteboard.generalPasteboard.string = @"@xantapers"; g_msgT = CFAbsoluteTimeGetCurrent(); snprintf(g_msg, sizeof g_msg, "Скопировано: @xantapers");
+            }] ]] ]];
+
+    self.stacks = @[t0, t1, t2, t3];
     NSMutableArray *hs = [NSMutableArray new];
     self.scroll = [[UIScrollView alloc] initWithFrame:CGRectMake(14, 86, 262, 100)];
     self.scroll.showsVerticalScrollIndicator = NO;
@@ -673,7 +713,7 @@ static NSString *TpTitle(int i) {
     [self.header addGestureRecognizer:[[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(pan:)]];
     [self.panel addSubview:self.header];
 
-    UISegmentedControl *tabs = [[UISegmentedControl alloc] initWithItems:@[@"Игра", @"Предметы", @"Телепорт"]];
+    UISegmentedControl *tabs = [[UISegmentedControl alloc] initWithItems:@[@"Игра", @"Предметы", @"Телепорт", @"Автор"]];
     tabs.frame = CGRectMake(14, 46, 262, 32); tabs.selectedSegmentIndex = 0; [self styleSeg:tabs];
     [tabs addAction:[UIAction actionWithHandler:^(UIAction *a) { [ws selectTab:tabs.selectedSegmentIndex]; }] forControlEvents:UIControlEventValueChanged];
     [self.panel addSubview:tabs]; [self.panel addSubview:self.scroll];
@@ -725,7 +765,10 @@ static NSString *TpTitle(int i) {
             bool alive = CFAbsoluteTimeGetCurrent() - g_grannySeen < 1.0;
             s.distLabel.text = alive ? [NSString stringWithFormat:@"Бабка: %.1f м", g_grannyDist] : @"Бабка: —";
             if (CFAbsoluteTimeGetCurrent() - g_msgT < 6.0) s.msgLabel.text = [NSString stringWithUTF8String:g_msg];
-            s.dbgLabel.text = (S.esp || S.espGranny) ? [NSString stringWithUTF8String:g_dbg] : @"";
+            NSMutableString *dt = [NSMutableString new];
+            if (S.esp || S.espGranny) [dt appendString:[NSString stringWithUTF8String:g_dbg]];
+            if (S.ammo) { if (dt.length) [dt appendString:@"\n"]; [dt appendString:[NSString stringWithUTF8String:g_dbg2]]; }
+            s.dbgLabel.text = dt;
         }
     }];
 }
