@@ -91,7 +91,8 @@ static bool Inv(void *m, void *obj, void **args, void **ret = NULL) {
 // Unity-методы
 static void *m_getPos, *m_setPos, *m_getFwd, *m_goTr, *m_goSetActive, *m_goActive;
 static void *m_camMain, *m_w2s, *m_ccMove, *m_collEnabled, *m_scrW, *m_scrH, *m_findObjs, *m_instantiate;
-static void *k_Inv;   // класс InventoryController
+static void *k_Inv, *k_Cam;   // классы InventoryController и Camera
+static void *m_compTr, *m_behEnabled, *m_camDepth, *m_camOrtho, *m_checkInv;
 
 static bool GetV3(void *m, void *obj, V3 *out) {
     void *r = NULL;
@@ -106,10 +107,11 @@ static void SetEnabled(void *coll, bool v) { void *a[1] = { &v }; Inv(m_collEnab
 static struct {
     float grannySpeed = 1.0f, playerSpeed = 1.0f, jumpMul = 1.0f, flySpeed = 6.0f;
     bool blind = false, noGrab = false, noFall = false, sprint = false;
-    bool deaf = false, noHit = false, airJump = false;
+    bool deaf = false, noHit = false, airJump = false, jumpBtn = true;
     bool fly = false, noclip = false, esp = false, espGranny = false, ammo = false;
 } S;
-static volatile bool  g_up = false, g_down = false;
+static volatile bool  g_up = false, g_down = false, g_jumpReq = false;
+static char g_dbg[200] = "";
 static volatile int   g_tpReq = -1, g_bringReq = -1, g_bringMode = 0;   // mode: 0 переместить, 1 клонировать
 static volatile float g_grannyDist = -1;
 static volatile CFAbsoluteTime g_grannySeen = 0, g_msgT = 0, g_espT = 0;
@@ -147,7 +149,7 @@ static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
 
 // ───────────── офсеты ─────────────
 static int oWalk, oFollow, oAttack, oSee, oHunt, oDist, oHearP, oHearO, oDontHit, oGrannyTr;
-static int oFwd, oBack, oSide, oFallHurt, oFallDead, oJump, oCanJump, oThisTr, oChar, oCamPivot, oJoy, oVelY, oAir;
+static int oFwd, oBack, oSide, oFallHurt, oFallDead, oJump, oCanJump, oThisTr, oChar, oCamPivot, oJoy, oVelY, oAir, oGround;
 static int oInX, oSprintGone, oShotLoaded, oHaveShotgun, oHaveArrow, oArrowOK, oHaveCrossbow;
 static int g_hooks = 0;
 
@@ -177,35 +179,58 @@ static void *FindInventory() {
     return *(void **)((char *)arr + 0x20);
 }
 
+static void *FindCamera() {
+    void *cam = NULL;
+    if (Inv(m_camMain, NULL, NULL, &cam) && cam) return cam;       // Camera.main
+    if (!k_Cam || !m_findObjs) return NULL;
+    void *typ = il2cpp_type_get_object(il2cpp_class_get_type(k_Cam));
+    void *a[1] = { typ }, *arr = NULL;
+    if (!Inv(m_findObjs, NULL, a, &arr) || !arr) return NULL;
+    uint32_t n = *(uint32_t *)((char *)arr + 0x18);
+    void *best = NULL; float bd = -1e9f;
+    for (uint32_t i = 0; i < n && i < 16; i++) {
+        void *c = *(void **)((char *)arr + 0x20 + 8 * i), *r = NULL;
+        if (!c) continue;
+        if (!Inv(m_behEnabled, c, NULL, &r) || !r || !*(bool *)il2cpp_object_unbox(r)) continue;   // выключена
+        if (Inv(m_camOrtho, c, NULL, &r) && r && *(bool *)il2cpp_object_unbox(r)) continue;        // UI-камера
+        float d = 0; if (Inv(m_camDepth, c, NULL, &r) && r) d = *(float *)il2cpp_object_unbox(r);
+        if (d > bd) { bd = d; best = c; }
+    }
+    return best;
+}
+
 static void ComputeESP(void *inv, void *playerTr) {
-    void *cam = NULL, *r = NULL;
-    if (!Inv(m_camMain, NULL, NULL, &cam) || !cam) return;
+    void *cam = FindCamera(), *r = NULL;
+    if (!cam) { snprintf(g_dbg, sizeof g_dbg, "ESP: камера не найдена"); return; }
     int sw = 0, sh = 0;
     if (Inv(m_scrW, NULL, NULL, &r) && r) sw = *(int *)il2cpp_object_unbox(r);
     if (Inv(m_scrH, NULL, NULL, &r) && r) sh = *(int *)il2cpp_object_unbox(r);
-    if (sw <= 0 || sh <= 0) return;
-    V3 me; if (!GetV3(m_getPos, playerTr, &me)) return;
+    if (sw <= 0 || sh <= 0) { snprintf(g_dbg, sizeof g_dbg, "ESP: размер экрана %dx%d", sw, sh); return; }
+    V3 me; if (!GetV3(m_getPos, playerTr, &me)) { snprintf(g_dbg, sizeof g_dbg, "ESP: нет позиции игрока"); return; }
     auto proj = [&](V3 p, V3 *out) -> bool {
         void *a[1] = { &p }, *rs = NULL;
         if (!Inv(m_w2s, cam, a, &rs) || !rs) return false;
         *out = *(V3 *)il2cpp_object_unbox(rs); return out->z > 0;
     };
-    Esp tmp[64]; int n = 0;
+    Esp tmp[64]; int n = 0, itemsActive = 0, itemsVisible = 0; const char *gs = "выкл";
 
-    // Бабка: рамка от ног до головы (≈1.8 м)
-    if (S.espGranny && g_granny && oGrannyTr >= 0 && CFAbsoluteTimeGetCurrent() - g_grannySeen < 1.0) {
-        void *gt = PTR(g_granny, oGrannyTr); V3 p, feet, head;
-        if (gt && GetV3(m_getPos, gt, &p)) {
-            V3 hp = { p.x, p.y + 1.8f, p.z };
-            if (proj(p, &feet) && proj(hp, &head)) {
-                float hpx = fabsf(head.y - feet.y);
-                float dx = p.x - me.x, dy = p.y - me.y, dz = p.z - me.z;
-                tmp[n++] = { feet.x / sw, 1.0f - ((feet.y + head.y) * 0.5f) / sh, sqrtf(dx*dx + dy*dy + dz*dz), -1,
-                             0.5f * hpx / sw, hpx / sh };
-            }
+    if (S.espGranny) {
+        gs = "нет в сцене";
+        if (g_granny && CFAbsoluteTimeGetCurrent() - g_grannySeen < 1.0) {
+            void *gt = NULL; V3 p, feet, head;
+            if (Inv(m_compTr, g_granny, NULL, &gt) && gt && GetV3(m_getPos, gt, &p)) {
+                gs = "за кадром";
+                V3 hp = { p.x, p.y + 1.8f, p.z };
+                if (proj(p, &feet) && proj(hp, &head)) {
+                    float hpx = fabsf(head.y - feet.y);
+                    float dx = p.x - me.x, dy = p.y - me.y, dz = p.z - me.z;
+                    tmp[n++] = { feet.x / sw, 1.0f - ((feet.y + head.y) * 0.5f) / sh, sqrtf(dx*dx + dy*dy + dz*dz), -1,
+                                 0.5f * hpx / sw, hpx / sh };
+                    gs = "ок";
+                }
+            } else gs = "нет позиции";
         }
     }
-    // Предметы
     if (S.esp && inv) {
         for (int i = 0; i < NI && n < 63; i++) {
             if (itemOff[i] < 0) continue;
@@ -213,28 +238,35 @@ static void ComputeESP(void *inv, void *playerTr) {
             if (itemHave[i] >= 0 && BOOL_(inv, itemHave[i])) continue;
             void *ra = NULL;
             if (!Inv(m_goActive, go, NULL, &ra) || !ra || !*(bool *)il2cpp_object_unbox(ra)) continue;
+            itemsActive++;
             void *tr = NULL; if (!Inv(m_goTr, go, NULL, &tr) || !tr) continue;
             V3 p, sp; if (!GetV3(m_getPos, tr, &p) || !proj(p, &sp)) continue;
+            itemsVisible++;
             float dx = p.x - me.x, dy = p.y - me.y, dz = p.z - me.z;
             tmp[n++] = { sp.x / sw, 1.0f - sp.y / sh, sqrtf(dx*dx + dy*dy + dz*dz), i, 0, 0 };
         }
     }
+    snprintf(g_dbg, sizeof g_dbg, "ESP: экран %dx%d | Бабка: %s | предметы: активных %d, на экране %d", sw, sh, gs, itemsActive, itemsVisible);
     pthread_mutex_lock(&g_mu); memcpy(g_esp, tmp, sizeof(Esp) * n); g_espN = n; pthread_mutex_unlock(&g_mu);
     g_espT = CFAbsoluteTimeGetCurrent();
 }
 
+// сдвиг игрока при включённом CharacterController: выключить → переставить → включить (CC подхватывает позицию)
+static void Reposition(void *tr, void *cc, float dx, float dy, float dz) {
+    V3 p; if (!GetV3(m_getPos, tr, &p)) return;
+    SetEnabled(cc, false); V3 q = { p.x + dx, p.y + dy, p.z + dz }; SetPos(tr, q); SetEnabled(cc, true);
+}
+
 static void (*o_PlayerFU)(void *, void *);
 static void h_PlayerFU(void *self, void *mi) {
-    static void *last; static float bf, bb, bs, bj; static int frame = 0, ccRe = 0;
+    static void *last; static float bf, bb, bs; static int frame = 0, ccRe = 0; static float jv = 0;
     static bool ccOff = false; static void *inv = NULL; static V3 saved; static bool savedOk = false;
     if (self != last) {
         last = self; ccOff = false; inv = NULL; ccRe = 0;
-        bf = FLT(self, oFwd); bb = FLT(self, oBack); bs = FLT(self, oSide); bj = FLT(self, oJump);
+        bf = FLT(self, oFwd); bb = FLT(self, oBack); bs = FLT(self, oSide); jv = 0;
     }
     frame++;
     FLT(self, oFwd) = bf * S.playerSpeed; FLT(self, oBack) = bb * S.playerSpeed; FLT(self, oSide) = bs * S.playerSpeed;
-    FLT(self, oJump) = bj * S.jumpMul;
-    if (S.airJump) BOOL_(self, oCanJump) = true;
     if (S.noFall || S.fly || S.noclip) { FLT(self, oFallHurt) = 1e9f; FLT(self, oFallDead) = 1e9f; }
 
     void *tr = PTR(self, oThisTr), *cc = PTR(self, oChar), *cam = PTR(self, oCamPivot), *joy = PTR(self, oJoy);
@@ -256,7 +288,7 @@ static void h_PlayerFU(void *self, void *mi) {
             if (!alive) Msg("Бабка не найдена в сцене");
             else {
                 void *t = NULL;
-                if (r == 2) t = PTR(g_granny, oGrannyTr);
+                if (r == 2) Inv(m_compTr, g_granny, NULL, &t);
                 else if (r - 100 >= 0 && r - 100 < NT && tpOff[r - 100] >= 0) t = PTR(g_granny, tpOff[r - 100]);
                 if (t && GetV3(m_getPos, t, &d)) { d.y += (r == 2 ? 0.2f : 1.0f); ok = true; }
                 else Msg("Точка недоступна");
@@ -272,17 +304,22 @@ static void h_PlayerFU(void *self, void *mi) {
     if (g_bringReq >= 0) {
         int i = g_bringReq; g_bringReq = -1;
         void *go = (inv && i < NI && itemOff[i] >= 0) ? PTR(inv, itemOff[i]) : NULL;
-        V3 me, f;
-        if (!go) Msg("Нет такого предмета в сцене");
-        else if (!GetV3(m_getPos, tr, &me) || !GetV3(m_getFwd, cam, &f)) Msg("Нет позиции игрока");
-        else {
-            float l = sqrtf(f.x*f.x + f.z*f.z); if (l < 0.001f) l = 1;
-            V3 d = { me.x + f.x / l * 1.5f, me.y + 0.6f, me.z + f.z / l * 1.5f };
-            if (g_bringMode == 1) {
-                Q4 q = {0,0,0,1}; void *a[3] = { go, &d, &q }; void *clone = NULL;
-                if (Inv(m_instantiate, NULL, a, &clone) && clone) Msg("Клон создан: %s", kItems[i]);
-                else Msg("Не удалось клонировать %s", kItems[i]);
-            } else {
+        if (!inv) Msg("Инвентарь не найден (зайди в игру)");
+        else if (g_bringMode == 0) {   // выдать через флаги игры
+            if (itemHave[i] < 0) Msg("%s: нет флага — попробуй «Переместить»", kItems[i]);
+            else {
+                bool was = BOOL_(inv, itemHave[i]); BOOL_(inv, itemHave[i]) = true;
+                if (go) { bool t = true; void *a[1] = { &t }; Inv(m_goSetActive, go, a); }
+                bool ok = Inv(m_checkInv, inv, NULL);
+                Msg("Выдано: %s (было: %s, обновление: %s)", kItems[i], was ? "да" : "нет", ok ? "ок" : "ошибка");
+            }
+        } else {                        // переместить объект сцены к игроку
+            V3 me, f;
+            if (!go) Msg("Нет такого предмета в сцене");
+            else if (!GetV3(m_getPos, tr, &me) || !GetV3(m_getFwd, cam, &f)) Msg("Нет позиции игрока");
+            else {
+                float l = sqrtf(f.x*f.x + f.z*f.z); if (l < 0.001f) l = 1;
+                V3 d = { me.x + f.x / l * 1.5f, me.y + 0.6f, me.z + f.z / l * 1.5f };
                 bool t = true; void *a[1] = { &t }; void *gtr = NULL;
                 if (!Inv(m_goSetActive, go, a) || !Inv(m_goTr, go, NULL, &gtr) || !gtr || !SetPos(gtr, d))
                     Msg("Объект %s уничтожен или недоступен", kItems[i]);
@@ -319,12 +356,20 @@ static void h_PlayerFU(void *self, void *mi) {
         }
     } else {
         if (ccOff) { if (cc) SetEnabled(cc, true); ccOff = false; }
-        if (S.fly && cc) { V3 mv = { 0, up * S.flySpeed * dt + 0.004f, 0 }; void *a[1] = { &mv }; Inv(m_ccMove, cc, a); }
+        // прыжок (кнопка на экране): своя баллистика, вверх только пока jv > 0
+        if (g_jumpReq) {
+            g_jumpReq = false;
+            bool grounded = (oGround < 0) || BOOL_(self, oGround);
+            if (grounded || S.airJump) jv = 5.5f * S.jumpMul;
+        }
+        float dy = 0;
+        if (S.fly) dy += up * S.flySpeed * dt + 0.0039f;      // + компенсация гравитации игры
+        if (jv > 0) { dy += jv * dt; jv -= 9.81f * dt; }
+        if (dy != 0 && cc && ccRe == 0) Reposition(tr, cc, 0, dy, 0);
     }
     if (ccRe > 0 && !ccOff && --ccRe == 0 && cc) SetEnabled(cc, true);
 
     o_PlayerFU(self, mi);
-    if (S.airJump) BOOL_(self, oCanJump) = true;
     if ((S.fly || S.noclip) && oVelY >= 0) FLT(self, oVelY) = 0;
 }
 
@@ -358,6 +403,11 @@ static void Setup() {
     m_ccMove = M(kCC, "Move", 1); m_collEnabled = M(kColl, "set_enabled", 1);
     m_scrW = M(kScr, "get_width", 0); m_scrH = M(kScr, "get_height", 0);
     m_findObjs = M(kObj, "FindObjectsOfType", 1);
+    k_Cam = kCam;
+    m_compTr = M(FindClass("UnityEngine", "Component"), "get_transform", 0);
+    m_behEnabled = M(FindClass("UnityEngine", "Behaviour"), "get_enabled", 0);
+    m_camDepth = M(kCam, "get_depth", 0); m_camOrtho = M(kCam, "get_orthographic", 0);
+    m_checkInv = M(k_Inv, "CheckInventory", 0);
     m_instantiate = kObj ? MByParam(kObj, "Instantiate", 3, 1, "UnityEngine.Vector3") : NULL;
     NSLog(@"[Xantapers] unity api: pos=%p set=%p fwd=%p goTr=%p act=%p cam=%p w2s=%p cc=%p coll=%p find=%p inst=%p",
           m_getPos, m_setPos, m_getFwd, m_goTr, m_goActive, m_camMain, m_w2s, m_ccMove, m_collEnabled, m_findObjs, m_instantiate);
@@ -371,7 +421,7 @@ static void Setup() {
     oFallHurt = Off(kPlayer, "fallHurtBad"); oFallDead = Off(kPlayer, "fallDead");
     oJump = Off(kPlayer, "jumpSpeed"); oCanJump = Off(kPlayer, "canJump");
     oThisTr = Off(kPlayer, "thisTransform"); oChar = Off(kPlayer, "character"); oCamPivot = Off(kPlayer, "cameraPivot");
-    oJoy = Off(kPlayer, "joystick"); oAir = Off(kPlayer, "timeInAir");
+    oJoy = Off(kPlayer, "joystick"); oAir = Off(kPlayer, "timeInAir"); oGround = Off(kPlayer, "PlayerIsGrounded");
     int v = Off(kPlayer, "velocity"); oVelY = v >= 0 ? v + 4 : -1;
     oInX = Off(kJoy, "<inputDir>k__BackingField");
     oSprintGone = Off(kSprint, "sprintGone");
@@ -385,8 +435,8 @@ static void Setup() {
     }
     for (int i = 0; i < NT; i++) tpOff[i] = Off(kGranny, kTp[i]);
 
-    int core[] = { oWalk,oFollow,oAttack,oSee,oHunt,oDist,oHearP,oHearO,oDontHit,oGrannyTr,oFwd,oBack,oSide,
-                   oFallHurt,oFallDead,oJump,oCanJump,oThisTr,oChar,oCamPivot,oJoy,oSprintGone };
+    int core[] = { oWalk,oFollow,oAttack,oSee,oHunt,oDist,oHearP,oHearO,oDontHit,oFwd,oBack,oSide,
+                   oFallHurt,oFallDead,oThisTr,oChar,oCamPivot,oJoy,oSprintGone };
     for (int o : core) if (o < 0) { NSLog(@"[Xantapers] не найдено базовое поле — хуки не ставлю"); return; }
 
     Hook(kGranny, "FixedUpdate", (void *)h_GrannyFU,  (void **)&o_GrannyFU);
@@ -432,7 +482,8 @@ static NSString *TpTitle(int i) {
 @property (nonatomic, strong) NSArray<UIStackView *> *stacks;
 @property (nonatomic, strong) NSArray<NSNumber *> *heights;
 @property (nonatomic, strong) NSMutableArray<UILabel *> *pool;
-@property (nonatomic, strong) UILabel *distLabel, *msgLabel, *gLabel;
+@property (nonatomic, strong) UILabel *distLabel, *msgLabel, *gLabel, *dbgLabel;
+@property (nonatomic, strong) UIButton *jumpButton;
 + (instancetype)shared;
 - (void)install;
 @end
@@ -466,10 +517,13 @@ static NSString *TpTitle(int i) {
     return c;
 }
 - (UIView *)toggle:(NSString *)t flag:(bool *)flag {
+    return [self toggle:t flag:flag then:nil];
+}
+- (UIView *)toggle:(NSString *)t flag:(bool *)flag then:(void (^)(bool))cb {
     UILabel *l = [self label:t size:14 color:UIColor.whiteColor];
     UISwitch *sw = [UISwitch new]; sw.on = *flag; sw.onTintColor = ACCENT;
     [sw setContentHuggingPriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
-    [sw addAction:[UIAction actionWithHandler:^(UIAction *a) { *flag = sw.on; }] forControlEvents:UIControlEventValueChanged];
+    [sw addAction:[UIAction actionWithHandler:^(UIAction *a) { *flag = sw.on; if (cb) cb(sw.on); }] forControlEvents:UIControlEventValueChanged];
     UIStackView *r = [[UIStackView alloc] initWithArrangedSubviews:@[l, sw]]; r.alignment = UIStackViewAlignmentCenter; r.spacing = 8; return r;
 }
 - (UIView *)slider:(NSString *)t value:(float *)v max:(float)max {
@@ -549,15 +603,17 @@ static NSString *TpTitle(int i) {
     self.distLabel = [self label:@"Бабка: —" size:15 color:UIColor.whiteColor];
     self.distLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightBold];
     self.msgLabel = [self label:[NSString stringWithFormat:@"Хуки: %d/3", g_hooks] size:12 color:[UIColor colorWithWhite:1 alpha:0.55]];
+    self.dbgLabel = [self label:@"" size:11 color:[UIColor colorWithWhite:1 alpha:0.4]];
     UIStackView *upDown = [[UIStackView alloc] initWithArrangedSubviews:@[ [self hold:@"▲  Вверх" flag:&g_up], [self hold:@"▼  Вниз" flag:&g_down] ]];
     upDown.distribution = UIStackViewDistributionFillEqually; upDown.spacing = 8;
     UIStackView *t0 = [self column:@[
-        [self card:@"Статус" rows:@[ self.distLabel, self.msgLabel ]],
+        [self card:@"Статус" rows:@[ self.distLabel, self.msgLabel, self.dbgLabel ]],
         [self card:@"Визуал" rows:@[ [self toggle:@"ESP: Бабка (рамка)" flag:&S.espGranny], [self toggle:@"ESP: предметы" flag:&S.esp] ]],
         [self card:@"Бабка" rows:@[ [self slider:@"Скорость (0 = стоит)" value:&S.grannySpeed max:2],
             [self toggle:@"Слепая" flag:&S.blind], [self toggle:@"Глухая" flag:&S.deaf],
             [self toggle:@"Не хватает" flag:&S.noGrab], [self toggle:@"Не бьёт" flag:&S.noHit] ]],
-        [self card:@"Игрок" rows:@[ [self slider:@"Скорость" value:&S.playerSpeed max:3], [self slider:@"Высота прыжка" value:&S.jumpMul max:3],
+        [self card:@"Игрок" rows:@[ [self slider:@"Скорость" value:&S.playerSpeed max:3], [self toggle:@"Кнопка прыжка на экране" flag:&S.jumpBtn then:^(bool on) { ws.jumpButton.hidden = !on; }],
+            [self slider:@"Сила прыжка" value:&S.jumpMul max:3],
             [self toggle:@"Прыжок в воздухе" flag:&S.airJump], [self toggle:@"Без урона от падения" flag:&S.noFall],
             [self toggle:@"Бесконечный спринт" flag:&S.sprint], [self toggle:@"Бесконечные патроны" flag:&S.ammo] ]],
         [self card:@"Полёт" rows:@[ [self toggle:@"Полёт" flag:&S.fly], [self toggle:@"Noclip (сквозь стены)" flag:&S.noclip],
@@ -565,13 +621,13 @@ static NSString *TpTitle(int i) {
     ]];
 
     // ── вкладка «Предметы» ──
-    UISegmentedControl *mode = [[UISegmentedControl alloc] initWithItems:@[@"Переместить", @"Клонировать"]];
+    UISegmentedControl *mode = [[UISegmentedControl alloc] initWithItems:@[@"Выдать в инвентарь", @"Переместить"]];
     mode.selectedSegmentIndex = 0; [self styleSeg:mode];
     [mode addAction:[UIAction actionWithHandler:^(UIAction *a) { g_bringMode = (int)mode.selectedSegmentIndex; }] forControlEvents:UIControlEventValueChanged];
     NSMutableArray *items = [NSMutableArray new];
     for (int i = 0; i < NI; i++) { int idx = i; [items addObject:[self button:ItemTitle(i) primary:NO block:^{ g_bringReq = idx; }]]; }
     UIStackView *t1 = [self column:@[
-        [self card:@"Режим" rows:@[ [self label:@"Нажми на предмет — он появится перед тобой." size:12 color:[UIColor colorWithWhite:1 alpha:0.6]], mode ]],
+        [self card:@"Режим" rows:@[ [self label:@"«Выдать» ставит предмету флаг игры и обновляет инвентарь. «Переместить» переносит объект сцены к тебе." size:12 color:[UIColor colorWithWhite:1 alpha:0.6]], mode ]],
         [self card:@"Предметы" rows:items ] ]];
 
     // ── вкладка «Телепорт» ──
@@ -631,6 +687,16 @@ static NSString *TpTitle(int i) {
     [fab addAction:[UIAction actionWithHandler:^(UIAction *a) { ws.panel.hidden = !ws.panel.hidden; }] forControlEvents:UIControlEventTouchUpInside];
     [fab addGestureRecognizer:[[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(pan:)]];
     [w addSubview:self.panel]; [w addSubview:fab];
+    // ── кнопка прыжка ──
+    UIButton *jb = [UIButton buttonWithType:UIButtonTypeSystem];
+    CGSize ws2 = w.bounds.size;
+    jb.frame = CGRectMake(ws2.width - 100, ws2.height * 0.5, 64, 64); jb.layer.cornerRadius = 32;
+    jb.backgroundColor = [ACCENT colorWithAlphaComponent:0.75]; jb.layer.borderWidth = 1.5; jb.layer.borderColor = UIColor.whiteColor.CGColor;
+    [jb setTitle:@"⤒" forState:UIControlStateNormal]; [jb setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+    jb.titleLabel.font = [UIFont systemFontOfSize:30 weight:UIFontWeightBold];
+    [jb addAction:[UIAction actionWithHandler:^(UIAction *a) { g_jumpReq = true; }] forControlEvents:UIControlEventTouchDown];
+    [jb addGestureRecognizer:[[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(pan:)]];
+    jb.hidden = !S.jumpBtn; self.jumpButton = jb; [w addSubview:jb];
     [self selectTab:0];
 
     __block int tick = 0;
@@ -659,6 +725,7 @@ static NSString *TpTitle(int i) {
             bool alive = CFAbsoluteTimeGetCurrent() - g_grannySeen < 1.0;
             s.distLabel.text = alive ? [NSString stringWithFormat:@"Бабка: %.1f м", g_grannyDist] : @"Бабка: —";
             if (CFAbsoluteTimeGetCurrent() - g_msgT < 6.0) s.msgLabel.text = [NSString stringWithUTF8String:g_msg];
+            s.dbgLabel.text = (S.esp || S.espGranny) ? [NSString stringWithUTF8String:g_dbg] : @"";
         }
     }];
 }
