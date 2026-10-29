@@ -11,7 +11,8 @@ jobs:
         run: |
           xcrun -sdk iphoneos clang++ -arch arm64 -std=c++17 -fobjc-arc \
             -miphoneos-version-min=14.0 -dynamiclib \
-            -framework UIKit -framework Foundation \
+            -framework UIKit -framework Foundation -framework CoreGraphics -framework QuartzCore \
+
             -install_name @rpath/GrannyMod.dylib \
             -o GrannyMod.dylib Tweak.mm
           file GrannyMod.dylib
